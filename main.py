@@ -5,24 +5,19 @@ from unidecode import unidecode
 from credentials import trello_credentials, supabase_credentials
 from supabase import create_client, Client
 
-# --- CONFIGURAÇÕES TRELLO ---
 LISTA_ALVO = "CADÊNCIA DE NUTRIÇÃO"
 MEMBRO_ALVO = "samantha"
-
-# --- CREDENCIAIS TRELLO ---
 client = TrelloClient(
     api_key=trello_credentials['api_key'],
     token=trello_credentials['token']
 )
 
-# --- CREDENCIAIS SUPABASE ---
 supabase: Client = create_client(
     supabase_credentials['url'],
     supabase_credentials['key']
 )
 supabase_table_name = "trello_comentarios"
 
-# --- FUNÇÃO DE EXTRAÇÃO ---
 def extract_info(text):
     if not text:
         return [], []
@@ -38,7 +33,6 @@ def extract_info(text):
 
     return cleaned_names, cleaned_emails
 
-# --- PROCESSA COMENTÁRIOS E SINCRONIZA COM SUPABASE ---
 board = client.get_board('e30OHAsU')
 print("🔎 Buscando comentários no Trello e sincronizando com o Supabase...")
 
@@ -50,7 +44,6 @@ try:
                     autor = unidecode(comment['memberCreator'].get('fullName', '').lower())
                     texto_comentario = comment['data']['text']
 
-                    # Verifica se o comentário atende aos critérios
                     if MEMBRO_ALVO in autor or MEMBRO_ALVO in unidecode(texto_comentario.lower()):
                         nomes, emails = extract_info(texto_comentario)
                         nome = nomes[0] if nomes else ""
@@ -71,11 +64,11 @@ try:
                         response = supabase.from_(supabase_table_name).upsert(supabase_data).execute()
 
                         if response.data:
-                            print(f"✅ Registro para o comentário '{comment['id']}' enviado com sucesso.")
+                            print(f"Registro para o comentário '{comment['id']}' enviado com sucesso.")
                         else:
-                            print(f"\n❌ Erro ao enviar registro (ID: {comment['id']}): {response.error}")
+                            print(f"\nErro ao enviar registro (ID: {comment['id']}): {response.error}")
 
 except Exception as e:
-    print(f"\n❌ Ocorreu um erro geral durante a execução: {e}")
+    print(f"\nOcorreu um erro geral durante a execução: {e}")
 
-print("\n✅ Sincronização concluída!")
+print("\nSincronização concluída!")
