@@ -8,9 +8,7 @@ Este projeto tem como objetivo extrair comentários do Trello de uma lista espec
 
   -Filtra comentários feitos em uma lista e por um membro específico.
 
-  -Extrai automaticamente:
-   Nome citado no comentário
-   E-mail citado no comentário
+  -Extrai automaticamente: Nome citado no comentário e E-mail citado no comentário
 
   -Sincroniza os dados com uma tabela no Supabase (trello_comentarios).
 
