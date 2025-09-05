@@ -5,9 +5,13 @@ import json
 from unidecode import unidecode
 from credentials import trello_credentials, supabase_credentials
 from supabase import create_client, Client
+import requests.exceptions
+import os
+from datetime import datetime
 
-# --- CONFIGURAÇÕES GLOBAIS ---
+# --- VARIÁVEIS GLOBAIS ---
 SUPABASE_TABLE_NAME = "trello_comentarios"
+LAST_RUN_FILE = "last_run.txt"
 
 # --- LISTA DOS QUADROS (BOARDS) A SEREM PROCESSADOS ---
 BOARD_IDS = [
@@ -16,17 +20,6 @@ BOARD_IDS = [
     'WXyXBHeb',
     'e30OHAsU'
 ]
-
-# --- INICIALIZA CLIENTES ---
-client = TrelloClient(
-    api_key=trello_credentials['api_key'],
-    token=trello_credentials['token']
-)
-
-supabase: Client = create_client(
-    supabase_credentials['url'],
-    supabase_credentials['key']
-)
 
 # --- FUNÇÃO DE EXTRAÇÃO QUE CRIA PARES DE NOME-E-MAIL ---
 def extract_info(text):
@@ -49,6 +42,7 @@ def extract_info(text):
                 nome_socio = socio_data.get('nome')
                 emails_socio = socio_data.get('emails', [])
                 
+                # Converte strings vazias em None
                 if nome_socio == "":
                     nome_socio = None
                 
@@ -65,17 +59,15 @@ def extract_info(text):
             for email_dict in data['emails']:
                 email_value = email_dict.get('e-mail')
                 if email_value:
-                    # Adiciona e-mails sem nome associado
                     data_entries.append({'nome': None, 'email': email_value})
 
-        # --- NOVA LÓGICA: DEDUPLICAÇÃO ---
+        # --- DEDUPLICAÇÃO E TRATAMENTO DE VALORES ---
         seen_emails = set()
         unique_entries = []
         for entry in data_entries:
             if entry['email'] not in seen_emails and entry['email'] is not None:
                 seen_emails.add(entry['email'])
                 unique_entries.append(entry)
-            # Se o e-mail for None, adiciona o registro apenas se ele não existir
             elif entry['email'] is None and not any(e['email'] is None for e in unique_entries):
                 unique_entries.append(entry)
         
@@ -90,15 +82,12 @@ def extract_info(text):
         found_emails = re.findall(email_pattern, text, re.IGNORECASE)
         
         data_entries_text = []
-        # Adiciona e-mails encontrados
         for email in found_emails:
             data_entries_text.append({'nome': found_names[0] if found_names else None, 'email': email})
 
-        # Adiciona nomes sem e-mail (se houver)
         if not found_emails and found_names:
             data_entries_text.append({'nome': found_names[0], 'email': None})
         
-        # Deduplicação dos e-mails encontrados via regex
         seen_emails = set()
         unique_entries_text = []
         for entry in data_entries_text:
@@ -110,13 +99,42 @@ def extract_info(text):
 
         return unique_entries_text
 
-# --- PROCESSA COMENTÁRIOS E SINCRONIZA COM SUPABASE ---
-try:
-    print("\n🔎 Buscando novos dados em múltiplos quadros do Trello...")
+
+# --- FUNÇÃO PRINCIPAL DE SINCRONIZAÇÃO ---
+def sync_trello_to_supabase():
+    
+    # 1. TRATAMENTO DE ERROS GENÉRICOS DE CONEXÃO E CREDENCIAIS
+    try:
+        # Inicializa clientes com as credenciais do seu arquivo `credentials.py`
+        trello_client = TrelloClient(
+            api_key=trello_credentials['api_key'],
+            token=trello_credentials['token']
+        )
+        supabase_client: Client = create_client(
+            supabase_credentials['url'],
+            supabase_credentials['key']
+        )
+    except Exception as e:
+        print(f"Erro ao inicializar clientes. Verifique suas credenciais em 'credentials.py'. Erro: {e}")
+        return
+
+    # 2. SINCRONIZAÇÃO INCREMENTAL
+    last_run_timestamp = None
+    if os.path.exists(LAST_RUN_FILE):
+        with open(LAST_RUN_FILE, 'r') as f:
+            last_run_timestamp = f.read().strip()
+            print(f"Sincronizando comentários desde: {last_run_timestamp}")
+    else:
+        print("Primeira execução. Buscando todos os comentários.")
+
+    current_run_timestamp = datetime.now().isoformat()
+    
+    # --- PROCESSO DE SINCRONIZAÇÃO ---
+    print("\nBuscando novos dados em múltiplos quadros do Trello...")
     
     for board_id in BOARD_IDS:
         try:
-            board = client.get_board(board_id)
+            board = trello_client.get_board(board_id)
             print(f"\n--- Processando quadro: '{board.name}' (ID: {board_id}) ---")
 
             for lista in board.all_lists():
@@ -129,65 +147,61 @@ try:
                     
                     empresa = card.name 
                     
-                    for comment in card.fetch_comments():
+                    # 3. TRATAMENTO DE ERROS DA API DO TRELLO
+                    try:
+                        comments = card.fetch_comments()
+                        # Filtrar comentários por data (sincronização incremental)
+                        if last_run_timestamp:
+                            comments = [c for c in comments if c['date'] > last_run_timestamp]
                         
-                        autor_comentario = comment['memberCreator'].get('fullName', '')
-                        texto_comentario = comment['data']['text']
-                        
-                        dados_encontrados = extract_info(texto_comentario)
-                        
-                        data_comentario = pd.to_datetime(comment['date']).strftime('%Y-%m-%d')
-                        
-                        for entry in dados_encontrados:
-                            
-                            supabase_data = {
-                                "id_comentario": str(comment['id']),
-                                "id_cartao": str(card.id),
-                                "id_lista": str(list_id), 
-                                "lista": str(list_name),
-                                "cartao": str(empresa),
-                                "url": str(card.url),
-                                "autor_comentario": str(autor_comentario),
-                                "nome_no_comentario": entry['nome'],
-                                "email_no_comentario": entry['email'],
-                                "data": data_comentario
-                            }
-                            
-                            response = supabase.from_(SUPABASE_TABLE_NAME).select('id_comentario').eq('id_comentario', supabase_data['id_comentario']).eq('email_no_comentario', entry['email']).execute()
+                        if not comments:
+                            continue
 
-                            if response.data:
-                                print(f"🔄 Registro com e-mail '{entry['email']}' já existe. Ignorando.")
-                            else:
-                                response = supabase.from_(SUPABASE_TABLE_NAME).insert(supabase_data).execute()
-                                if response.data:
-                                    print(f"✅ Novo registro para o e-mail '{entry['email']}' enviado com sucesso.")
-                                else:
-                                    print(f"\n❌ Erro ao inserir novo registro (ID: {comment['id']}, Email: {entry['email']}): {response.error}")
-                        
-                        if not dados_encontrados:
-                            supabase_data = {
-                                "id_comentario": str(comment['id']),
-                                "id_cartao": str(card.id),
-                                "id_lista": str(list_id), 
-                                "lista": str(list_name),
-                                "cartao": str(empresa),
-                                "url": str(card.url),
-                                "autor_comentario": str(autor_comentario),
-                                "nome_no_comentario": None,
-                                "email_no_comentario": None,
-                                "data": data_comentario
-                            }
-                            response = supabase.from_(SUPABASE_TABLE_NAME).select('id_comentario').eq('id_comentario', supabase_data['id_comentario']).execute()
-                            if not response.data:
-                                supabase.from_(SUPABASE_TABLE_NAME).insert(supabase_data).execute()
-                                print(f"✅ Novo registro para o comentário '{comment['id']}' sem dados enviados com sucesso.")
+                        for comment in comments:
+                            autor_comentario = comment['memberCreator'].get('fullName', '')
+                            texto_comentario = comment['data']['text']
+                            dados_encontrados = extract_info(texto_comentario)
+                            data_comentario = pd.to_datetime(comment['date']).strftime('%Y-%m-%d')
+                            
+                            for entry in dados_encontrados:
+                                supabase_data = {
+                                    "id_comentario": str(comment['id']),
+                                    "id_cartao": str(card.id),
+                                    "id_lista": str(list_id), 
+                                    "lista": str(list_name),
+                                    "cartao": str(empresa),
+                                    "url": str(card.url),
+                                    "autor_comentario": str(autor_comentario),
+                                    "nome_no_comentario": entry['nome'],
+                                    "email_no_comentario": entry['email'],
+                                    "data": data_comentario
+                                }
 
+                                # 4. TRATAMENTO DE ERROS DO SUPABASE
+                                try:
+                                    response = supabase_client.from_(SUPABASE_TABLE_NAME).select('id_comentario').eq('id_comentario', supabase_data['id_comentario']).eq('email_no_comentario', entry['email']).execute()
+                                    if response.data:
+                                        print(f"Registro com e-mail '{entry['email']}' já existe. Ignorando.")
+                                    else:
+                                        supabase_client.from_(SUPABASE_TABLE_NAME).insert(supabase_data).execute()
+                                        print(f"Novo registro para o e-mail '{entry['email']}' enviado com sucesso.")
+
+                                except Exception as db_e:
+                                    print(f"Erro ao interagir com o Supabase para o e-mail '{entry['email']}'. Erro: {db_e}")
+
+                    except requests.exceptions.RequestException as trello_e:
+                        print(f"Erro de conexão com a API do Trello. Verifique sua rede ou as credenciais. Erro: {trello_e}")
+                    except Exception as e:
+                        print(f"Ocorreu um erro ao processar os comentários do cartão '{card.name}'. Erro: {e}")
 
         except Exception as e:
-            print(f"❌ Ocorreu um erro ao processar o quadro com ID '{board_id}': {e}")
+            print(f"Ocorreu um erro ao processar o quadro com ID '{board_id}': {e}")
+    
+    # Salva o timestamp da execução atual para a próxima vez
+    with open(LAST_RUN_FILE, 'w') as f:
+        f.write(current_run_timestamp)
+        print(f"\nSincronização concluída! Timestamp da execução salvo em '{LAST_RUN_FILE}'.")
 
-
-except Exception as e:
-    print(f"\n❌ Ocorreu um erro geral durante a execução: {e}")
-
-print("\n✅ Sincronização concluída!")
+# Executa a função principal
+if __name__ == "__main__":
+    sync_trello_to_supabase()
