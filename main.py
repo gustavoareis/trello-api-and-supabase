@@ -51,8 +51,6 @@ def extract_info(text):
                         email_value = email_dict.get('e-mail')
                         if email_value:
                             data_entries.append({'nome': nome_socio, 'email': email_value})
-                elif nome_socio:
-                    data_entries.append({'nome': nome_socio, 'email': None})
         
         # 2. Extrai e-mails da seção "emails" principal (sem nome associado)
         if 'emails' in data and data['emails']:
@@ -68,8 +66,6 @@ def extract_info(text):
             if entry['email'] not in seen_emails and entry['email'] is not None:
                 seen_emails.add(entry['email'])
                 unique_entries.append(entry)
-            elif entry['email'] is None and not any(e['email'] is None for e in unique_entries):
-                unique_entries.append(entry)
         
         return unique_entries
 
@@ -82,22 +78,13 @@ def extract_info(text):
         found_emails = re.findall(email_pattern, text, re.IGNORECASE)
         
         data_entries_text = []
-        for email in found_emails:
-            data_entries_text.append({'nome': found_names[0] if found_names else None, 'email': email})
-
-        if not found_emails and found_names:
-            data_entries_text.append({'nome': found_names[0], 'email': None})
-        
         seen_emails = set()
-        unique_entries_text = []
-        for entry in data_entries_text:
-            if entry['email'] not in seen_emails and entry['email'] is not None:
-                seen_emails.add(entry['email'])
-                unique_entries_text.append(entry)
-            elif entry['email'] is None and not any(e['email'] is None for e in unique_entries_text):
-                unique_entries_text.append(entry)
+        for email in found_emails:
+            if email not in seen_emails:
+                data_entries_text.append({'nome': found_names[0] if found_names else None, 'email': email})
+                seen_emails.add(email)
 
-        return unique_entries_text
+        return data_entries_text
 
 
 # --- FUNÇÃO PRINCIPAL DE SINCRONIZAÇÃO ---
@@ -161,6 +148,11 @@ def sync_trello_to_supabase():
                             autor_comentario = comment['memberCreator'].get('fullName', '')
                             texto_comentario = comment['data']['text']
                             dados_encontrados = extract_info(texto_comentario)
+                            
+                            # --- AQUI ESTÁ A MUDANÇA: SÓ PROCESSA SE HOUVER E-MAIL ---
+                            if not dados_encontrados:
+                                continue
+
                             data_comentario = pd.to_datetime(comment['date']).strftime('%Y-%m-%d')
                             
                             for entry in dados_encontrados:
