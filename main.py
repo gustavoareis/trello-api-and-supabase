@@ -31,48 +31,129 @@ BOARD_LIST_TIPOS = {
     "e30OHAsU": {"default": "nutrição"},
 }
 
-
 # --- EXTRAÇÃO E NORMALIZAÇÃO DE INFORMAÇÕES ---
 def extract_info(text):
-    """Extrai informações de nome e e-mail de um texto.
-    Prioriza JSON, fallback para regex.
+    """Extrai informações de nome, e-mail, telefone/whatsapp de um texto.
+    Marca se pertence a sócio ou não.
     """
     if not text:
         return []
 
     data_entries = []
 
-    # 1. Tenta extrair de JSON
+    # Regex para e-mail
+    email_pattern = r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
+    # Regex para telefone (formatos brasileiros comuns)
+    telefone_pattern = r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?\d{4,5}[- ]?\d{4}\b"
+
+    # 1. Tenta extrair de JSON estruturado
     try:
         data = json.loads(text)
         if "dados_socios" in data:
             for socio in data["dados_socios"] or []:
                 nome = socio.get("nome")
+                # E-mails do sócio
                 for email_dict in socio.get("emails", []):
                     email = email_dict.get("e-mail")
                     if email:
-                        data_entries.append({"nome": nome, "email": email.lower()})
+                        data_entries.append({
+                            "nome": nome,
+                            "email": email.lower(),
+                            "telefone": None,
+                            "whatsapp": None,
+                            "is_socio": True
+                        })
+                # Telefones do sócio
+                for tel_dict in socio.get("telefones", []):
+                    telefone = tel_dict.get("telefone")
+                    if telefone:
+                        telefone_num = re.sub(r"\D", "", telefone)
+                        is_whatsapp = (
+                            len(telefone_num) >= 11 and telefone_num[-9] == "9"
+                        )
+                        data_entries.append({
+                            "nome": nome,
+                            "email": None,
+                            "telefone": telefone_num,
+                            "whatsapp": telefone_num if is_whatsapp else None,
+                            "is_socio": True
+                        })
         if "emails" in data:
             for email_dict in data["emails"] or []:
                 email = email_dict.get("e-mail")
                 if email:
-                    data_entries.append({"nome": None, "email": email.lower()})
+                    data_entries.append({
+                        "nome": None,
+                        "email": email.lower(),
+                        "telefone": None,
+                        "whatsapp": None,
+                        "is_socio": False
+                    })
     except json.JSONDecodeError:
-        # 2. Se a decodificação JSON falhar, usa regex
-        email_pattern = r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
+        # 2. Regex fallback (sem estrutura → não é sócio)
         found_emails = re.findall(email_pattern, text, re.IGNORECASE)
         for e in found_emails:
-            data_entries.append({"nome": None, "email": e.lower()})
+            data_entries.append({
+                "nome": None,
+                "email": e.lower(),
+                "telefone": None,
+                "whatsapp": None,
+                "is_socio": False
+            })
 
-    # Remove duplicatas
+        found_tels = re.findall(telefone_pattern, text)
+        for t in found_tels:
+            telefone_num = re.sub(r"\D", "", t)
+            is_whatsapp = (
+                len(telefone_num) >= 11 and telefone_num[-9] == "9"
+            )
+            data_entries.append({
+                "nome": None,
+                "email": None,
+                "telefone": telefone_num,
+                "whatsapp": telefone_num if is_whatsapp else None,
+                "is_socio": False
+            })
+
+    # Remove duplicatas dentro do mesmo comentário (padrão atual)
     seen = set()
     unique_entries = []
     for entry in data_entries:
-        if entry["email"] not in seen:
-            seen.add(entry["email"])
+        key = f"{entry.get('email')}-{entry.get('telefone')}-{entry.get('whatsapp')}-{entry.get('is_socio')}"
+        if key not in seen:
+            seen.add(key)
             unique_entries.append(entry)
 
     return unique_entries
+
+
+# --- DEDUPE PARA CHAVE DE UPSERT ---
+def _conflict_key(row):
+    """Normaliza a chave de conflito (id_comentario, email, telefone) para dedupe."""
+    return (
+        row["id_comentario"],
+        (row.get("email_no_comentario") or "").lower(),
+        row.get("telefone") or "",
+    )
+
+def dedupe_for_upsert(rows):
+    """
+    Remove entradas duplicadas pela chave de conflito dentro do mesmo comando.
+    Critério de escolha: prefere quem tem whatsapp preenchido; depois data mais recente;
+    em último caso, a última ocorrência.
+    """
+    keep = {}
+    for i, r in enumerate(rows):
+        key = _conflict_key(r)
+        score = (
+            1 if (r.get("whatsapp") not in (None, "")) else 0,
+            (r.get("data") or ""),
+            i,  # desempate: última vence
+        )
+        prev = keep.get(key)
+        if (prev is None) or (score > prev["score"]):
+            keep[key] = {"row": r, "score": score}
+    return [v["row"] for v in keep.values()]
 
 
 # --- FUNÇÃO PARA PEGAR TODOS OS COMENTÁRIOS VIA REST ---
@@ -106,7 +187,7 @@ def fetch_all_comments(board_id):
 
             all_comments.extend(batch)
             before = batch[-1]["id"]
-            time.sleep(0.2)  # para não estourar rate limit
+            time.sleep(0.2)
         except requests.exceptions.RequestException as e:
             logging.error(f"Erro ao buscar comentários do board {board_id}: {e}")
             break
@@ -131,7 +212,7 @@ def sync_trello_to_supabase():
 
     new_rows = []
 
-    # 2. Processa cada board configurado
+    # Processa cada board configurado
     for board_id, regras in BOARD_LIST_TIPOS.items():
         logging.info(f"Iniciando processamento do board: {board_id}")
         comments = fetch_all_comments(board_id)
@@ -179,28 +260,42 @@ def sync_trello_to_supabase():
                         "cartao": card_name,
                         "url": card_url,
                         "autor_comentario": autor,
-                        "nome_no_comentario": entry["nome"],
-                        "email_no_comentario": entry["email"],
-                        "data": comment_date,  # string "YYYY-MM-DD"
+                        "nome_no_comentario": entry.get("nome"),
+                        "email_no_comentario": (entry.get("email") or None),  # já vem lower()
+                        "telefone": entry.get("telefone") or None,
+                        "whatsapp": entry.get("whatsapp") or None,
+                        "is_socio": entry.get("is_socio"),
+                        "data": comment_date,
                         "id_board": board_id,
                         "tipo_de_campanha": tipo,
                     }
                 )
 
-    # 3. Inserção em batch no Supabase com upsert
+    # --- DEDUPE GLOBAL ANTES DO UPSERT ---
+    if new_rows:
+        before_count = len(new_rows)
+        new_rows = dedupe_for_upsert(new_rows)
+        logging.info(f"Registros após dedupe global por chave de conflito: {len(new_rows)} (removidos {before_count - len(new_rows)})")
+
+    # Inserção em batch no Supabase com upsert (e dedupe também por batch)
     if new_rows:
         try:
             BATCH_SIZE = 500
             for i in range(0, len(new_rows), BATCH_SIZE):
                 batch = new_rows[i:i + BATCH_SIZE]
+                batch_before = len(batch)
+                batch = dedupe_for_upsert(batch)
+                if len(batch) != batch_before:
+                    logging.info(f"Dedupe no batch {i//BATCH_SIZE + 1}: {batch_before} -> {len(batch)}")
+
                 supabase_client.from_(SUPABASE_TABLE_NAME) \
-                    .upsert(batch, on_conflict="id_comentario,email_no_comentario") \
+                    .upsert(batch, on_conflict="id_comentario,email_no_comentario,telefone") \
                     .execute()
-            logging.info(f"Inseridos/atualizados {len(new_rows)} registros.")
+            logging.info(f"Inseridos/atualizados {len(new_rows)} registros (após dedupe).")
         except Exception as e:
             logging.error(f"Erro no insert batch: {e}")
     else:
-        logging.info("Nenhum novo registro encontrado.")
+        logging.info("Nenhum novo registro encontrado após dedupe.")
 
 
 if __name__ == "__main__":
