@@ -1,11 +1,11 @@
-import pandas as pd
 import re
 import json
 import requests
-from credentials import trello_credentials, supabase_credentials
-from supabase import create_client, Client
 import logging
 import time
+from datetime import datetime
+from credentials import trello_credentials, supabase_credentials
+from supabase import create_client, Client
 
 # --- CONFIGURAÇÃO DE LOGGING ---
 logging.basicConfig(
@@ -16,16 +16,26 @@ logging.basicConfig(
 
 # --- CONFIGURAÇÕES GLOBAIS ---
 SUPABASE_TABLE_NAME = "trello_comentarios"
-BOARD_IDS = ["kFrWQqjm", "tXcXz9Pl", "WXyXBHeb", "e30OHAsU"]
 TRELLO_BASE_URL = "https://api.trello.com/1"
+
+# --- MAPA DE TIPOS DE CAMPANHA POR BOARD/LISTA ---
+BOARD_LIST_TIPOS = {
+    "kFrWQqjm": {
+        "default": "nutrição",
+        "listas": {
+            "677ee6e1d3a3184d7a9e3a48": "higienização",
+        },
+    },
+    "tXcXz9Pl": {"default": "nutrição"},
+    "WXyXBHeb": {"default": "nutrição"},
+    "e30OHAsU": {"default": "nutrição"},
+}
 
 
 # --- EXTRAÇÃO E NORMALIZAÇÃO DE INFORMAÇÕES ---
 def extract_info(text):
-    """
-    Extrai informações de nome e e-mail de um texto.
-    Prioriza a extração de um JSON e, se falhar, usa regex.
-    Normaliza os e-mails para minúsculas.
+    """Extrai informações de nome e e-mail de um texto.
+    Prioriza JSON, fallback para regex.
     """
     if not text:
         return []
@@ -48,13 +58,13 @@ def extract_info(text):
                 if email:
                     data_entries.append({"nome": None, "email": email.lower()})
     except json.JSONDecodeError:
-        # 2. Se a decodificação JSON falhar, tenta extrair com regex
+        # 2. Se a decodificação JSON falhar, usa regex
         email_pattern = r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"
         found_emails = re.findall(email_pattern, text, re.IGNORECASE)
         for e in found_emails:
             data_entries.append({"nome": None, "email": e.lower()})
 
-    # Remove duplicatas baseadas no e-mail
+    # Remove duplicatas
     seen = set()
     unique_entries = []
     for entry in data_entries:
@@ -70,7 +80,7 @@ def fetch_all_comments(board_id):
     """Busca todos os comentários de um board, usando paginação."""
     all_comments = []
     before = None
-    batch_size = 1000  # máximo permitido pela API do Trello
+    batch_size = 1000  # limite da API Trello
 
     while True:
         params = {
@@ -85,16 +95,20 @@ def fetch_all_comments(board_id):
         url = f"{TRELLO_BASE_URL}/boards/{board_id}/actions"
         try:
             response = requests.get(url, params=params)
-            response.raise_for_status()  # Levanta um erro para status de erro (4xx, 5xx)
+            if response.status_code == 429:  # Rate limit
+                logging.warning("Rate limit atingido, aguardando 5s...")
+                time.sleep(5)
+                continue
+            response.raise_for_status()
             batch = response.json()
             if not batch:
                 break
 
             all_comments.extend(batch)
-            before = batch[-1]["id"]  # próximo batch
-            time.sleep(0.1)  # para não estourar rate limit
+            before = batch[-1]["id"]
+            time.sleep(0.2)  # para não estourar rate limit
         except requests.exceptions.RequestException as e:
-            logging.error(f"Erro de requisição ao buscar comentários do board {board_id}: {e}")
+            logging.error(f"Erro ao buscar comentários do board {board_id}: {e}")
             break
         except json.JSONDecodeError:
             logging.error(f"Erro ao decodificar JSON do board {board_id}. Resposta: {response.text}")
@@ -107,7 +121,6 @@ def fetch_all_comments(board_id):
 # --- FUNÇÃO PRINCIPAL ---
 def sync_trello_to_supabase():
     """Sincroniza comentários do Trello com a tabela do Supabase."""
-    # 1. Inicializa Supabase
     try:
         supabase_client: Client = create_client(
             supabase_credentials["url"], supabase_credentials["key"]
@@ -116,29 +129,27 @@ def sync_trello_to_supabase():
         logging.error(f"Erro ao inicializar Supabase: {e}")
         return
 
-    # 2. Carrega registros existentes para deduplicação
-    try:
-        existing = supabase_client.from_(SUPABASE_TABLE_NAME).select(
-            "id_comentario,email_no_comentario"
-        ).execute()
-        existing_set = {
-            (row["id_comentario"], row["email_no_comentario"]) for row in existing.data
-        }
-    except Exception as e:
-        logging.error(f"Erro ao carregar registros existentes do Supabase: {e}")
-        existing_set = set()
-
     new_rows = []
 
-    # 3. Processa cada board
-    for board_id in BOARD_IDS:
+    # 2. Processa cada board configurado
+    for board_id, regras in BOARD_LIST_TIPOS.items():
         logging.info(f"Iniciando processamento do board: {board_id}")
         comments = fetch_all_comments(board_id)
 
         for comment in comments:
             comment_id = str(comment.get("id", ""))
             comment_text = comment.get("data", {}).get("text", "")
-            comment_date = pd.to_datetime(comment.get("date")).strftime("%Y-%m-%d")
+
+            # Data segura convertida para string
+            date_raw = comment.get("date")
+            try:
+                comment_date = (
+                    datetime.fromisoformat(date_raw.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+                    if date_raw else None
+                )
+            except Exception:
+                comment_date = None
+
             autor = comment.get("memberCreator", {}).get("fullName", "")
 
             card = comment.get("data", {}).get("card", {})
@@ -150,17 +161,15 @@ def sync_trello_to_supabase():
             lista_id = lista.get("id", "Sem ID")
             lista_name = lista.get("name", "Sem Lista")
 
+            # --- Define tipo de campanha ---
+            tipo = regras.get("default")
+            tipo = regras.get("listas", {}).get(lista_id, tipo)
+
             dados = extract_info(comment_text)
             if not dados:
-                logging.debug(f"Comentário {comment_id} ignorado (sem e-mail).")
                 continue
 
             for entry in dados:
-                key = (comment_id, entry["email"])
-                if key in existing_set:
-                    logging.debug(f"Comentário {comment_id} com e-mail {entry['email']} já existe, ignorando.")
-                    continue
-
                 new_rows.append(
                     {
                         "id_comentario": comment_id,
@@ -172,19 +181,22 @@ def sync_trello_to_supabase():
                         "autor_comentario": autor,
                         "nome_no_comentario": entry["nome"],
                         "email_no_comentario": entry["email"],
-                        "data": comment_date,
+                        "data": comment_date,  # string "YYYY-MM-DD"
                         "id_board": board_id,
+                        "tipo_de_campanha": tipo,
                     }
                 )
 
-    # 4. Inserção em batch no Supabase
+    # 3. Inserção em batch no Supabase com upsert
     if new_rows:
         try:
             BATCH_SIZE = 500
             for i in range(0, len(new_rows), BATCH_SIZE):
                 batch = new_rows[i:i + BATCH_SIZE]
-                supabase_client.from_(SUPABASE_TABLE_NAME).insert(batch).execute()
-            logging.info(f"Inseridos {len(new_rows)} novos registros.")
+                supabase_client.from_(SUPABASE_TABLE_NAME) \
+                    .upsert(batch, on_conflict="id_comentario,email_no_comentario") \
+                    .execute()
+            logging.info(f"Inseridos/atualizados {len(new_rows)} registros.")
         except Exception as e:
             logging.error(f"Erro no insert batch: {e}")
     else:
